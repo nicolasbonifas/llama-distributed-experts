@@ -66,6 +66,14 @@ typedef bool (*ggml_rpc_expert_eval_callback)(
     float * output_data
 );
 
+// Callback function type for endpoint lookup on master side
+// Returns endpoint string for a given expert, or nullptr if local
+typedef const char * (*ggml_rpc_expert_endpoint_lookup_callback)(
+    void * user_data,           // User context (e.g., llama_model*)
+    int expert_id,              // Expert to lookup
+    int layer_id                // Layer ID
+);
+
 // Initialize expert RPC for a model (called once at startup)
 GGML_BACKEND_API bool ggml_rpc_expert_init(
     const char * model_path,
@@ -76,6 +84,12 @@ GGML_BACKEND_API bool ggml_rpc_expert_init(
 // Register evaluation callback (worker side only)
 GGML_BACKEND_API void ggml_rpc_expert_register_eval_callback(
     ggml_rpc_expert_eval_callback callback,
+    void * user_data
+);
+
+// Register endpoint lookup callback (master side only)
+GGML_BACKEND_API void ggml_rpc_expert_register_endpoint_lookup_callback(
+    ggml_rpc_expert_endpoint_lookup_callback callback,
     void * user_data
 );
 

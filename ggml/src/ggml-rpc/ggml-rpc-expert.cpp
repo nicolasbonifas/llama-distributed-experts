@@ -28,6 +28,10 @@ struct expert_rpc_state {
     // Evaluation callback (worker side)
     ggml_rpc_expert_eval_callback eval_callback = nullptr;
     void * eval_user_data = nullptr;
+
+    // Endpoint lookup callback (master side)
+    ggml_rpc_expert_endpoint_lookup_callback endpoint_lookup_callback = nullptr;
+    void * endpoint_lookup_user_data = nullptr;
 };
 
 static expert_rpc_state g_expert_rpc;
@@ -478,6 +482,15 @@ void ggml_rpc_expert_register_eval_callback(
     g_expert_rpc.eval_user_data = user_data;
 }
 
+void ggml_rpc_expert_register_endpoint_lookup_callback(
+    ggml_rpc_expert_endpoint_lookup_callback callback,
+    void * user_data
+) {
+    fprintf(stderr, "%s: registering endpoint lookup callback\n", __func__);
+    g_expert_rpc.endpoint_lookup_callback = callback;
+    g_expert_rpc.endpoint_lookup_user_data = user_data;
+}
+
 void ggml_rpc_expert_shutdown() {
     fprintf(stderr, "%s: shutting down expert RPC\n", __func__);
 
@@ -523,25 +536,82 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
         return false;
     }
 
-    fprintf(stderr, "%s: distributed dispatch for layer %d\n", __func__, layer_id);
-    fprintf(stderr, "%s: ids shape: [%lld, %lld, %lld, %lld]\n", __func__,
-            ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3]);
-    fprintf(stderr, "%s: input shape: [%lld, %lld, %lld, %lld]\n", __func__,
-            input->ne[0], input->ne[1], input->ne[2], input->ne[3]);
-    fprintf(stderr, "%s: output shape: [%lld, %lld, %lld, %lld]\n", __func__,
-            output->ne[0], output->ne[1], output->ne[2], output->ne[3]);
+    // Validate tensor types
+    if (ids->type != GGML_TYPE_I32) {
+        fprintf(stderr, "%s: expert IDs tensor must be I32, got %d\n", __func__, ids->type);
+        return false;
+    }
 
-    // TODO: Implement actual distributed dispatch logic
-    // For now, this is a stub that demonstrates the call path
+    // Read expert IDs from the tensor
+    // At execution time, the data is available on the backend
+    const int32_t * expert_ids = (const int32_t *)ids->data;
+    const int64_t n_experts = ids->ne[0];  // Number of experts selected
+    const int64_t n_tokens = ids->ne[1];   // Batch size
+
+    fprintf(stderr, "%s: layer %d - evaluating %lld experts for %lld tokens\n",
+            __func__, layer_id, n_experts, n_tokens);
+
+    // Log the expert IDs for debugging
+    fprintf(stderr, "%s: expert IDs: [", __func__);
+    for (int64_t i = 0; i < std::min(n_experts, (int64_t)10); i++) {
+        fprintf(stderr, "%d%s", expert_ids[i], i < std::min(n_experts, (int64_t)10) - 1 ? ", " : "");
+    }
+    if (n_experts > 10) {
+        fprintf(stderr, ", ... (%lld total)", n_experts);
+    }
+    fprintf(stderr, "]\n");
+
+    // Check if endpoint lookup callback is registered
+    if (g_expert_rpc.endpoint_lookup_callback == nullptr) {
+        fprintf(stderr, "%s: no endpoint lookup callback registered\n", __func__);
+        fprintf(stderr, "%s: falling back to local evaluation\n", __func__);
+        return false;  // Fallback to regular mul_mat_id
+    }
+
+    // Group experts by endpoint
+    std::map<std::string, std::vector<int>> experts_by_endpoint;
+    std::vector<int> local_experts;
+
+    for (int64_t i = 0; i < n_experts; i++) {
+        int expert_id = expert_ids[i];
+        const char * endpoint = g_expert_rpc.endpoint_lookup_callback(
+            model_ptr,  // Can be g_expert_rpc.endpoint_lookup_user_data or model_ptr
+            expert_id,
+            layer_id
+        );
+
+        if (endpoint == nullptr || endpoint[0] == '\0') {
+            // Local expert
+            local_experts.push_back(expert_id);
+        } else {
+            // Remote expert
+            experts_by_endpoint[std::string(endpoint)].push_back(expert_id);
+        }
+    }
+
+    fprintf(stderr, "%s: found %zu local experts, %zu remote endpoints\n",
+            __func__, local_experts.size(), experts_by_endpoint.size());
+
+    // Log remote expert groups
+    for (const auto & [endpoint, expert_list] : experts_by_endpoint) {
+        fprintf(stderr, "%s: endpoint %s has %zu experts\n",
+                __func__, endpoint.c_str(), expert_list.size());
+    }
+
+    // TODO: Implement actual RPC dispatch and result merging
     // Next steps:
-    // 1. Read expert IDs from ids tensor (data is available at execution time)
-    // 2. Use callback/interface to lookup which experts are remote
-    // 3. Group experts by endpoint
-    // 4. Call ggml_rpc_expert_evaluate() for remote expert groups
-    // 5. Handle local experts separately
-    // 6. Merge results into output tensor
+    // 1. ✅ Read expert IDs from ids tensor
+    // 2. ✅ Use callback to lookup which experts are remote
+    // 3. ✅ Group experts by endpoint
+    // 4. ⚠️ Call ggml_rpc_expert_evaluate() for remote expert groups
+    //       - Extract input data for these experts
+    //       - Collect results
+    // 5. ⚠️ Handle local experts separately
+    //       - Need to call partial mul_mat_id for only local experts
+    // 6. ⚠️ Merge remote and local results into output tensor
 
-    fprintf(stderr, "%s: WARNING - actual dispatch not yet implemented, will use local evaluation\n", __func__);
-    return false;  // Returning false causes fallback to regular mul_mat_id
+    fprintf(stderr, "%s: WARNING - RPC dispatch not fully implemented yet\n", __func__);
+    fprintf(stderr, "%s: falling back to local evaluation for all experts\n", __func__);
+    return false;  // Fallback to regular mul_mat_id
 }
 
