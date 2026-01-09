@@ -12,6 +12,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-rpc-expert.h"
 
 #include <algorithm>
 #include <cassert>
@@ -881,6 +882,20 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
                 model.has_remote_experts = true;
                 LLAMA_LOG_INFO("%s: distributed MoE mode enabled with %zu remote endpoint(s)\n",
                               __func__, model.expert_endpoints.size());
+
+                // Register endpoint lookup callback for distributed dispatch
+                auto endpoint_lookup_callback = [](void * user_data, int expert_id, int layer_id) -> const char * {
+                    llama_model * model = static_cast<llama_model *>(user_data);
+                    std::string endpoint = model->find_expert_endpoint(expert_id, layer_id);
+                    // Return empty string for local experts (not nullptr to avoid nullptr checks)
+                    // The callback infrastructure will cache the string
+                    static thread_local std::string cached_endpoint;
+                    cached_endpoint = endpoint;
+                    return cached_endpoint.empty() ? nullptr : cached_endpoint.c_str();
+                };
+
+                ggml_rpc_expert_register_endpoint_lookup_callback(endpoint_lookup_callback, &model);
+                LLAMA_LOG_INFO("%s: registered endpoint lookup callback for distributed MoE\n", __func__);
             }
         }
 
