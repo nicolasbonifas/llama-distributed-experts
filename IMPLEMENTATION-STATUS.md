@@ -351,6 +351,123 @@ ggml_tensor* build_moe_ffn_distributed(...) {
 - No timeout/retry logic yet
 - No async dispatch (sequential RPC calls)
 
+### Expert Replication and Load Balancing
+
+**Important Design Consideration:**
+
+The number of experts **loaded** on a node and the number of experts **queried** from that node are two independent factors:
+
+1. **Expert Loading (RAM/VRAM Constrained)**
+   - Which experts are available on a node depends on available memory
+   - Example: Node with 16GB VRAM can load 32 experts
+   - This is a **static** configuration at startup
+
+2. **Expert Querying (Speed/Latency Constrained)**
+   - Which node we query depends on current load and network latency
+   - Faster nodes can handle more queries
+   - This is a **dynamic** decision at runtime
+
+**Expert Replication Strategy:**
+
+Popular experts (frequently selected by router) should be replicated across multiple nodes:
+
+```
+# Expert 5 is popular - replicate it!
+Node 1: Experts [0-31, 5]     # Primary for 0-31, backup for 5
+Node 2: Experts [32-63, 5]    # Primary for 32-63, backup for 5
+Node 3: Experts [64-95]       # Primary for 64-95
+Node 4: Experts [96-127]      # Primary for 96-127
+```
+
+**Load Balancing Requirements:**
+
+When expert 5 is needed:
+- Check load on Node 1 and Node 2
+- Query the less-loaded node
+- If one fails, automatically fall back to other
+
+**Implementation Considerations:**
+
+```cpp
+// In model configuration:
+// Format: host:port:primary_range[+replicated_experts]
+// Example:
+--expert-rpc-servers "node1:50052:0-31+5,node2:50053:32-63+5,node3:50054:64-95"
+
+// In find_expert_endpoint():
+std::vector<std::string> find_expert_endpoints(int expert_id) {
+    // Returns LIST of endpoints that have this expert
+    // Sorted by: load, latency, availability
+}
+
+// In RPC dispatch:
+for (auto& endpoint : find_expert_endpoints(expert_id)) {
+    try {
+        result = ggml_rpc_expert_evaluate(endpoint, ...);
+        break;  // Success
+    } catch (...) {
+        // Try next endpoint
+        continue;
+    }
+}
+```
+
+**Load Balancing Metrics:**
+
+Track per-worker:
+- Current number of in-flight requests
+- Average response latency (EWMA)
+- Recent error rate
+- Available compute capacity
+
+Route requests to worker with:
+```
+score = (1.0 / latency) * (1.0 - load) * (1.0 - error_rate)
+```
+
+**Why This Matters:**
+
+Without load balancing:
+- Popular experts become bottlenecks
+- Some workers idle while others overloaded
+- Network failures cause inference to fail
+
+With load balancing:
+- Load distributed based on node capabilities
+- Automatic failover if node goes down
+- Better overall throughput
+
+**Memory vs Compute Trade-off:**
+
+```
+Strategy A: No Replication
+- Node 1: 32 experts, handles 25% of requests
+- Node 2: 32 experts, handles 25% of requests
+- Node 3: 32 experts, handles 25% of requests
+- Node 4: 32 experts, handles 25% of requests
+- Memory usage: 4 × 15GB = 60GB total
+- Load balance: Perfect (assuming uniform expert selection)
+
+Strategy B: Replicate Top-10 Popular Experts
+- Node 1: 32 experts + 10 replicas = 42 effective
+- Node 2: 32 experts + 10 replicas = 42 effective
+- Node 3: 32 experts + 10 replicas = 42 effective
+- Node 4: 32 experts + 10 replicas = 42 effective
+- Memory usage: 4 × 18GB = 72GB total (20% overhead)
+- Load balance: Excellent (popular experts load-balanced)
+```
+
+**Recommendation:**
+
+For production deployment:
+1. Start with no replication (simpler)
+2. Monitor which experts are most popular
+3. Add replication for top-K most-queried experts
+4. Implement basic load balancing (round-robin initially)
+5. Upgrade to latency-aware load balancing if needed
+
+This is a **future enhancement** - not needed for initial MVP.
+
 ## 🎯 Recommended Next Steps
 
 **For immediate progress:**
