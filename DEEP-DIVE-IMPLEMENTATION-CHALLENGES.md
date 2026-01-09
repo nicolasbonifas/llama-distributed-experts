@@ -1140,6 +1140,120 @@ llama.cpp serves different needs:
 - No Python dependency
 - Standalone binaries
 
+### Critical Hardware Limitation: GPU-Only Support
+
+**vLLM is primarily GPU-only** - this is a major architectural constraint:
+
+#### vLLM Hardware Support:
+- ✅ **NVIDIA GPUs** (CUDA) - Primary target, fully optimized
+- ⚠️ **AMD GPUs** (ROCm) - Supported but less tested
+- ⚠️ **CPU** - Experimental support, not recommended for production
+  - Relies on PyTorch CPU backend
+  - Missing CUDA-specific optimizations (PagedAttention, fused kernels)
+  - 5-10x slower than optimized CPU inference (like llama.cpp)
+- ❌ **NPU** - No support (not a PyTorch target)
+- ❌ **Apple Silicon** (Metal) - No native support
+- ❌ **Vulkan** - No support
+- ❌ **Mobile/embedded** - Not designed for this
+
+#### llama.cpp Hardware Support:
+- ✅ **CPU** - Heavily optimized with AVX2/AVX512/NEON
+- ✅ **NVIDIA GPUs** (CUDA) - Full offloading support
+- ✅ **AMD GPUs** (ROCm/Vulkan) - Full support
+- ✅ **Apple Silicon** (Metal) - Native optimizations
+- ✅ **Vulkan** - Cross-platform GPU support
+- ✅ **Intel NPU** - Via OpenVINO backend
+- ✅ **Qualcomm NPU** - Via QNN backend
+- ✅ **Mobile/ARM** - Optimized for edge deployment
+
+#### When This Matters for Distributed MoE:
+
+**Scenario 1: Heterogeneous Cluster**
+```
+├── Node 1: High-end NVIDIA GPU (A100)
+├── Node 2: Mid-range NVIDIA GPU (RTX 4090)
+├── Node 3: AMD GPU (MI250X)
+├── Node 4: CPU-only server (128 cores)
+└── Node 5: Mac Studio (M2 Ultra)
+```
+
+**With vLLM:**
+- ❌ Can only use Nodes 1-3 (GPU nodes)
+- ❌ Cannot utilize Node 4 (CPU) effectively
+- ❌ Cannot utilize Node 5 (Apple Silicon)
+- Must buy more GPUs if you run out of VRAM
+
+**With llama.cpp:**
+- ✅ Can use ALL nodes efficiently
+- ✅ Route cheaper computations to CPU/NPU nodes
+- ✅ Use whatever hardware is available
+- Maximize utilization of existing infrastructure
+
+**Scenario 2: Memory-Constrained Deployment**
+
+For a 405B parameter MoE model:
+- 128 experts × ~3GB each = ~384GB total
+- 4x A100 GPUs = 4 × 80GB = 320GB ❌ Not enough!
+
+**vLLM solution:**
+- Must buy more GPUs (expensive)
+- Or use smaller model (defeats purpose)
+
+**llama.cpp solution:**
+- Load 80 experts on GPUs (240GB)
+- Load 48 experts on CPU RAM (144GB)
+- Route less-used experts to CPU nodes
+- Works with existing hardware ✅
+
+**Scenario 3: Edge/Hybrid Deployment**
+
+```
+Cloud GPUs: Handle popular experts (fast, expensive)
+Edge CPUs: Handle rare experts (slower, cheap)
+```
+
+**vLLM:**
+- ❌ Cannot offload to edge CPU nodes effectively
+- Must keep all experts in cloud (expensive)
+
+**llama.cpp:**
+- ✅ Distribute experts across cloud + edge
+- ✅ Use edge nodes for rare experts
+- Reduce cloud GPU costs significantly
+
+#### When GPU-Only is Actually Fine:
+
+vLLM's GPU-only limitation doesn't matter if:
+- ✅ Pure GPU cluster (all nodes have modern NVIDIA GPUs)
+- ✅ Enough total VRAM to fit all experts
+- ✅ High-throughput serving (can amortize GPU costs)
+- ✅ Datacenter deployment (not edge/embedded)
+
+**Example: OpenAI/Anthropic-scale deployment**
+- 1000+ H100 GPUs
+- Dedicated GPU clusters
+- High request volume justifies hardware cost
+- vLLM's batching advantage maximizes GPU utilization
+- → vLLM is perfect here!
+
+#### Conclusion: Hardware Support Trade-offs
+
+**Use vLLM if:**
+- Pure GPU infrastructure
+- High throughput serving
+- Can invest in GPU hardware
+- Need continuous batching
+
+**Use llama.cpp if:**
+- Heterogeneous hardware (CPU/GPU/NPU mix)
+- Memory-constrained deployment
+- Edge/hybrid cloud deployment
+- Need broad hardware compatibility
+- CLI/embedded use cases
+
+**For this distributed MoE project:**
+Since we're exploring the concept for testing/learning, and llama.cpp's broad hardware support allows experimenting on whatever machines are available (laptops, desktop GPUs, cloud instances, etc.), the llama.cpp approach makes sense. vLLM would be better for production serving with dedicated GPU clusters.
+
 ### Hybrid Solution
 
 Best of both worlds:
