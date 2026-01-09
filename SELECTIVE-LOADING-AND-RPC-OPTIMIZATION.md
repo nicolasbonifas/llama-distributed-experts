@@ -238,33 +238,36 @@ class ExpertRPCClient {
 
 **Impact**: Eliminates TCP handshake overhead (~3-5ms per request).
 
-### Strategy 3: Request Batching
+### Strategy 3: Token Batching (Prompt Processing)
 
-**Problem**: Multiple workers might need different experts for the same input.
+**Scenario**: During prompt processing, multiple tokens are evaluated at the same layer simultaneously.
 
-**Solution**: Batch requests to same endpoint:
+**Solution**: Batch all tokens' expert requests together:
 
 ```cpp
-// Instead of:
-// Request 1: endpoint A, experts [5, 7]
-// Request 2: endpoint A, experts [12]
-// (2 network round trips)
+// Processing 10 tokens at layer 0:
+// Token 0: needs experts [5, 7]  from endpoint A
+// Token 1: needs experts [5, 12] from endpoint A
+// Token 2: needs experts [7, 19] from endpoint A
 
-// Do:
-// Request 1: endpoint A, experts [5, 7, 12]
-// (1 network round trip)
+// Batch into single request:
+Request to endpoint A: {
+    layer: 0,
+    experts: [5, 7, 12, 19],              // Union of all needed
+    inputs: [token0, token1, token2],     // All token inputs
+    weights: [weights for each token],
+    n_tokens: 3
+}
 
-struct BatchedRequest {
-    std::string endpoint;
-    std::vector<int> expert_ids;        // Combined list
-    std::vector<float*> input_ptrs;     // Same input for all
-    std::vector<float*> weight_ptrs;    // Weights per expert
-};
-
-// Dispatch once, distribute results
+// vs sending 3 separate requests
 ```
 
-**Impact**: Reduces network round trips by up to 50%.
+**Impact**:
+- Reduces network round trips from N → 1 (for N tokens)
+- Only applicable during **prompt processing** (parallel tokens)
+- **Not applicable** during autoregressive generation (one token at a time)
+
+**Note**: Naturally happens when you group experts by endpoint - no special logic needed!
 
 ### Strategy 4: Asynchronous Dispatch
 
@@ -330,54 +333,49 @@ if (network_is_slow) {
 
 **When it helps**: Network latency > 20ms per transfer.
 
-### Strategy 7: Predictive Caching
+### Strategy 7: Result Caching (Usually Not Practical)
+
+**Idea**: Cache expert outputs based on input tensor.
+
+**Reality**: Input tensors are different every forward pass, so cache hits are rare.
 
 ```cpp
-// IDEA: During prefill (prompt processing), experts might repeat
-std::unordered_map<CacheKey, Tensor> expert_output_cache;
-
-struct CacheKey {
-    int layer_id;
-    int expert_id;
-    size_t input_hash;  // Hash of input tensor
-};
-
-// Before RPC call:
-auto key = make_key(layer, expert, input);
-if (cache.contains(key)) {
-    return cache[key];  // Instant return
-}
-
-// After RPC:
-cache[key] = result;
+// Would need: hash(input_tensor) + layer + expert as key
+// But input changes every token, so almost never cache hits
 ```
 
-**Impact**: 100% latency reduction for cache hits (typically 10-30% in practice).
+**The few cases it might help:**
+- Speculative decoding (evaluating multiple draft tokens)
+- Extremely repetitive prompts (rare)
 
-### Strategy 8: Early Expert Prediction
+**Verdict**: ❌ Not recommended for typical use cases. Skip this optimization.
 
-**Advanced**: Predict which experts will be selected before running the router.
+### Strategy 8: Predictive Prefetching (Advanced - For Later)
+
+**Idea**: Predict which experts will be selected and start fetching before router completes.
 
 ```cpp
-// Idea: Use a lightweight model to predict expert selection
-// Start fetching predicted experts BEFORE router runs
+// Timeline with prefetching:
+// │─ Predict (1ms) ─│───── Router (5ms) ──────│
+//                   ↓
+//                   └──── RPC starts (10ms) ────│
+//                                              ↑ Router done 5ms earlier
+// Overlap RPC with router execution!
 
-// Step 1: Lightweight prediction (1ms)
-predicted_experts = fast_predictor(input);
-
-// Step 2: Start fetching in background
-for (expert in predicted_experts) {
-    async_prefetch(expert);  // Non-blocking
+// Simple version: Use previous layer's selection
+if (layer > 0) {
+    predicted = previous_layer_experts;
+    start_async_fetch(predicted);  // Speculative
 }
-
-// Step 3: Run actual router (5ms)
-selected_experts = router(input);
-
-// Step 4: Results might already be ready!
-results = get_results(selected_experts);  // Much faster if predicted correctly
+selected = run_router(input);  // Actual selection
 ```
 
-**Impact**: Can hide 50-80% of network latency if prediction accuracy > 80%.
+**Considerations**:
+- Needs high accuracy (>70%) to be worthwhile
+- Wastes bandwidth on mispredictions
+- Adjacent layers often select similar experts (60-80% overlap)
+
+**Verdict**: ⚠️ Save for later - only matters if network latency >50ms.
 
 ### Complete Optimized RPC Flow
 
@@ -423,21 +421,21 @@ ggml_tensor* evaluate_remote_experts_optimized(
 
 ### Latency Optimization Checklist
 
-**Must Have** (10-20ms savings):
+**Tier 1: Essential** (20-30ms savings):
 - [x] Use binary protocol (protobuf or raw)
 - [x] Connection pooling
-- [x] Async dispatch for multiple workers
-- [x] Zero-copy where possible
+- [x] Async dispatch for multiple endpoints
+- [x] Zero-copy I/O
 
-**Should Have** (5-10ms savings):
-- [ ] Request batching
-- [ ] Compress if network is slow
-- [ ] Efficient tensor serialization
+**Tier 2: Significant for Batch Processing** (10-20ms savings):
+- [ ] Token batching (only for prompt processing with multiple tokens)
+- [ ] Compression (only if network bandwidth is bottleneck)
+- [ ] FP16/BF16 tensors instead of FP32
 
-**Nice to Have** (advanced, 5-20ms savings):
-- [ ] Result caching
-- [ ] Expert prediction/prefetching
-- [ ] Custom memory allocators
+**Tier 3: Advanced/Research** (conditional benefits):
+- [ ] Predictive prefetching (only if network latency >50ms)
+- [ ] ~~Result caching~~ (not practical - skip this)
+- [ ] ~~Batching across layers~~ (not possible due to dependencies)
 
 ### Measurement & Profiling
 
@@ -479,13 +477,23 @@ if (metrics.network_time > 10ms) {
 **Without optimizations**:
 - Can be 5-10× worse (50-100ms)
 
-### Key Takeaway
+### Key Takeaways
 
-For distributed MoE, **latency is everything**. Every millisecond counts:
-- Use binary protocols
-- Reuse connections
-- Send requests in parallel
-- Avoid unnecessary copies
-- Measure everything
+**For distributed MoE, latency is critical**:
 
-With good optimization, RPC overhead can be < 10% of compute time, making distributed evaluation viable!
+✅ **Do these** (proven wins):
+1. Binary protocol (protobuf or raw binary)
+2. Connection pooling (reuse TCP connections)
+3. Async dispatch (parallel requests to multiple endpoints)
+4. Zero-copy I/O (direct buffer sends)
+5. Token batching (automatically works during prompt processing)
+
+❌ **Skip these** (not practical):
+- Result caching (inputs always change)
+- Batching across layers (layers depend on each other sequentially)
+
+⚠️ **Consider later** (advanced):
+- Predictive prefetching (complex, only helps with high latency)
+- Compression (only if network is the bottleneck)
+
+**Target**: With Tier 1 optimizations, RPC overhead should be 2-10ms per request, making distributed evaluation viable even for latency-sensitive applications.

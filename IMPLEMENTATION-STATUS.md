@@ -123,6 +123,24 @@ struct llama_model {
 
 Parse `--expert-rpc-servers` in `llama_model_load()` and populate this structure.
 
+### 8. RPC Optimization Priorities
+
+**Essential (implement first)**:
+- Binary protocol (Protocol Buffers or raw binary)
+- Connection pooling (reuse TCP connections)
+- Async dispatch (parallel calls to multiple endpoints)
+- Zero-copy I/O (direct buffer operations)
+
+**Beneficial for prompt processing**:
+- Token batching (naturally happens when batching multiple tokens)
+
+**Not recommended**:
+- ~~Result caching~~ (inputs always different)
+- ~~Batching across layers~~ (layers execute sequentially)
+
+**Advanced (save for later)**:
+- Predictive prefetching (complex, only helps with high network latency)
+
 ## Testing Steps
 
 1. **Build**:
