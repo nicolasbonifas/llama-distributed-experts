@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -480,6 +481,17 @@ struct llama_model {
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+
+    // distributed MoE expert evaluation
+    struct expert_endpoint {
+        std::string endpoint;      // "host:port"
+        std::set<int> expert_ids;  // experts on this endpoint
+    };
+    std::vector<expert_endpoint> expert_endpoints;
+    bool has_remote_experts = false;
+
+    // Find endpoint for given expert ID (returns empty string if local)
+    std::string find_expert_endpoint(int expert_id, int layer) const;
 
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();

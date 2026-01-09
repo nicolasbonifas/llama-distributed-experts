@@ -306,6 +306,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // distributed MoE expert evaluation
+        // format: host:port:expert_range[,host:port:expert_range...]
+        // example: "192.168.1.10:50052:0-31,192.168.1.11:50052:32-63"
+        const char * expert_rpc_servers;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible

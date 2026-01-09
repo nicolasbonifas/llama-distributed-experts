@@ -1369,6 +1369,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
 
+    // distributed MoE expert evaluation
+    if (!params.expert_rpc_servers.empty()) {
+        mparams.expert_rpc_servers = params.expert_rpc_servers.c_str();
+    } else {
+        mparams.expert_rpc_servers = nullptr;
+    }
+
     return mparams;
 }
 

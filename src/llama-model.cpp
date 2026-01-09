@@ -6973,6 +6973,21 @@ uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
 
+std::string llama_model::find_expert_endpoint(int expert_id, int layer) const {
+    // For now, assume all layers have the same expert distribution
+    // (layer parameter unused, but included for future flexibility)
+    (void)layer;
+
+    for (const auto & endpoint_info : expert_endpoints) {
+        if (endpoint_info.expert_ids.count(expert_id) > 0) {
+            return endpoint_info.endpoint;
+        }
+    }
+
+    // Expert not found in any remote endpoint - assume it's local
+    return "";
+}
+
 void llama_model::print_info() const {
     const std::string rope_scaling_type = llama_rope_scaling_type_name(hparams.rope_scaling_type_train);
 
@@ -7875,6 +7890,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.expert_rpc_servers          =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,

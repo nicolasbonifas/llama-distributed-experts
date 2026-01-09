@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 
 #if defined(_MSC_VER)
@@ -814,6 +816,73 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
 
         model.load_stats(ml);
         model.print_info();
+
+        // Parse distributed MoE expert servers configuration
+        if (params.expert_rpc_servers != nullptr && params.expert_rpc_servers[0] != '\0') {
+            std::string servers_config(params.expert_rpc_servers);
+            std::stringstream ss(servers_config);
+            std::string endpoint_spec;
+
+            // Helper function to parse expert range (e.g., "0-31" or "0,5,10")
+            auto parse_expert_range_local = [](const std::string & range) -> std::set<int> {
+                std::set<int> expert_ids;
+                std::stringstream range_ss(range);
+                std::string segment;
+
+                while (std::getline(range_ss, segment, ',')) {
+                    size_t dash_pos = segment.find('-');
+                    if (dash_pos != std::string::npos) {
+                        int start = std::stoi(segment.substr(0, dash_pos));
+                        int end = std::stoi(segment.substr(dash_pos + 1));
+                        for (int i = start; i <= end; ++i) {
+                            expert_ids.insert(i);
+                        }
+                    } else {
+                        expert_ids.insert(std::stoi(segment));
+                    }
+                }
+                return expert_ids;
+            };
+
+            while (std::getline(ss, endpoint_spec, ',')) {
+                // Format: host:port:expert_range
+                // Example: "192.168.1.10:50052:0-31"
+                size_t first_colon = endpoint_spec.find(':');
+                size_t last_colon = endpoint_spec.rfind(':');
+
+                if (first_colon == std::string::npos || last_colon == std::string::npos || first_colon == last_colon) {
+                    LLAMA_LOG_ERROR("%s: invalid expert RPC server format: %s\n", __func__, endpoint_spec.c_str());
+                    LLAMA_LOG_ERROR("%s: expected format: host:port:expert_range\n", __func__);
+                    return -1;
+                }
+
+                std::string host = endpoint_spec.substr(0, first_colon);
+                std::string port = endpoint_spec.substr(first_colon + 1, last_colon - first_colon - 1);
+                std::string range = endpoint_spec.substr(last_colon + 1);
+
+                std::string endpoint = host + ":" + port;
+                std::set<int> expert_ids = parse_expert_range_local(range);
+
+                if (expert_ids.empty()) {
+                    LLAMA_LOG_ERROR("%s: invalid expert range: %s\n", __func__, range.c_str());
+                    return -1;
+                }
+
+                llama_model::expert_endpoint ep;
+                ep.endpoint = endpoint;
+                ep.expert_ids = expert_ids;
+                model.expert_endpoints.push_back(ep);
+
+                LLAMA_LOG_INFO("%s: configured remote experts on %s: %zu experts\n",
+                              __func__, endpoint.c_str(), expert_ids.size());
+            }
+
+            if (!model.expert_endpoints.empty()) {
+                model.has_remote_experts = true;
+                LLAMA_LOG_INFO("%s: distributed MoE mode enabled with %zu remote endpoint(s)\n",
+                              __func__, model.expert_endpoints.size());
+            }
+        }
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
