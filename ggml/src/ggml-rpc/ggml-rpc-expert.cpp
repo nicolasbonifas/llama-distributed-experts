@@ -598,20 +598,91 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
                 __func__, endpoint.c_str(), expert_list.size());
     }
 
-    // TODO: Implement actual RPC dispatch and result merging
-    // Next steps:
-    // 1. ✅ Read expert IDs from ids tensor
-    // 2. ✅ Use callback to lookup which experts are remote
-    // 3. ✅ Group experts by endpoint
-    // 4. ⚠️ Call ggml_rpc_expert_evaluate() for remote expert groups
-    //       - Extract input data for these experts
-    //       - Collect results
-    // 5. ⚠️ Handle local experts separately
-    //       - Need to call partial mul_mat_id for only local experts
-    // 6. ⚠️ Merge remote and local results into output tensor
+    // If all experts are local, fall back to regular evaluation
+    if (experts_by_endpoint.empty()) {
+        fprintf(stderr, "%s: all experts are local, using regular mul_mat_id\n", __func__);
+        return false;
+    }
 
-    fprintf(stderr, "%s: WARNING - RPC dispatch not fully implemented yet\n", __func__);
-    fprintf(stderr, "%s: falling back to local evaluation for all experts\n", __func__);
-    return false;  // Fallback to regular mul_mat_id
+    // If we have both local and remote experts, we need to merge results
+    // For now, we'll implement remote-only dispatch, then add merging
+    if (!local_experts.empty()) {
+        fprintf(stderr, "%s: WARNING - mixed local/remote not yet supported\n", __func__);
+        fprintf(stderr, "%s: falling back to local evaluation\n", __func__);
+        return false;
+    }
+
+    // Extract tensor dimensions
+    const int64_t n_embd = input->ne[0];   // Embedding dimension
+    const int64_t n_ff = output->ne[0];    // FFN dimension
+
+    fprintf(stderr, "%s: tensor dimensions - n_embd=%lld, n_ff=%lld, n_tokens=%lld\n",
+            __func__, n_embd, n_ff, n_tokens);
+
+    // For the remote-only case, we need to:
+    // 1. Extract input data: [n_embd * n_tokens]
+    // 2. Extract router weights for the selected experts
+    // 3. Call RPC for each endpoint
+    // 4. Collect results into output tensor
+
+    // Get pointers to tensor data
+    const float * input_data = (const float *)input->data;
+    float * output_data = (float *)output->data;
+
+    // For now, create dummy weights (uniform)
+    // TODO: Extract actual router weights from the graph
+    std::vector<float> router_weights(n_experts * n_tokens, 1.0f / (float)n_experts);
+
+    fprintf(stderr, "%s: WARNING - using uniform weights (1/%lld), router weights not yet extracted\n",
+            __func__, n_experts);
+
+    // Dispatch to each remote endpoint
+    bool all_success = true;
+    for (const auto & [endpoint, expert_list] : experts_by_endpoint) {
+        fprintf(stderr, "%s: dispatching %zu experts to %s\n",
+                __func__, expert_list.size(), endpoint.c_str());
+
+        // Convert expert IDs to uint8_t array
+        std::vector<uint8_t> expert_ids_u8(expert_list.begin(), expert_list.end());
+
+        // Allocate buffer for this endpoint's output
+        std::vector<float> endpoint_output(n_embd * n_tokens, 0.0f);
+
+        // Make RPC call
+        bool success = ggml_rpc_expert_evaluate(
+            endpoint.c_str(),
+            (uint8_t)layer_id,
+            (uint8_t)expert_list.size(),
+            expert_ids_u8.data(),
+            (uint16_t)n_tokens,
+            (uint32_t)n_embd,
+            (uint32_t)n_ff,
+            router_weights.data(),
+            input_data,
+            endpoint_output.data()
+        );
+
+        if (!success) {
+            fprintf(stderr, "%s: RPC call to %s failed\n", __func__, endpoint.c_str());
+            all_success = false;
+            continue;
+        }
+
+        fprintf(stderr, "%s: RPC call to %s succeeded\n", __func__, endpoint.c_str());
+
+        // Accumulate results into output
+        // TODO: This is simplified - we need proper result mapping
+        for (size_t i = 0; i < endpoint_output.size(); i++) {
+            output_data[i] += endpoint_output[i];
+        }
+    }
+
+    if (!all_success) {
+        fprintf(stderr, "%s: some RPC calls failed, falling back to local evaluation\n", __func__);
+        return false;
+    }
+
+    fprintf(stderr, "%s: distributed dispatch completed successfully\n", __func__);
+    return true;  // Success - we handled the dispatch
 }
 
