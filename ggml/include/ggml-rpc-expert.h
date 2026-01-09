@@ -13,6 +13,12 @@ extern "C" {
 #define GGML_RPC_EXPERT_MAGIC      0x45585052 // "EXPR" in hex
 #define GGML_RPC_EXPERT_VERSION    1
 
+// Status codes
+#define GGML_RPC_EXPERT_STATUS_SUCCESS       0
+#define GGML_RPC_EXPERT_STATUS_ERROR         1
+#define GGML_RPC_EXPERT_STATUS_NOT_FOUND     2
+#define GGML_RPC_EXPERT_STATUS_INVALID_REQ   3
+
 // Request from master to worker: evaluate experts
 struct ggml_rpc_expert_request {
     uint32_t magic;              // Protocol magic number
