@@ -428,6 +428,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_model            * model;  // needed for distributed MoE expert routing
 
     uint32_t n_outputs;
 
@@ -591,6 +592,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_model            * model;  // needed for distributed MoE expert routing
 
     const llm_graph_cb & cb_func;
 

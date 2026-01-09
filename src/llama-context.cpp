@@ -1520,6 +1520,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.model       =*/ &model,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-model.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -646,6 +647,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    model            (params.model),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1051,6 +1053,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
+    // Distributed MoE: Check if we need to dispatch to remote experts
+    // TODO: For a complete implementation, we need to:
+    // 1. Extract expert IDs from selected_experts tensor (currently on GPU/backend)
+    // 2. Split into local vs remote expert sets based on model->expert_endpoints
+    // 3. Create separate computation paths for local and remote experts
+    // 4. Call ggml_rpc_expert_evaluate() for remote experts
+    // 5. Merge local and remote results in the final aggregation
+    //
+    // Challenges:
+    // - selected_experts is a ggml_tensor on backend, not directly readable here
+    // - Need to split tensor operations based on runtime routing information
+    // - Current code path assumes all experts evaluated together via ggml_mul_mat_id
+    //
+    // For now, log if remote experts are configured (evaluation continues locally)
+    if (model && model->has_remote_experts) {
+        LLAMA_LOG_WARN("%s: distributed MoE configured but remote expert dispatch not yet implemented (layer %d)\n",
+                      __func__, il);
+        LLAMA_LOG_WARN("%s: all experts will be evaluated locally for now\n", __func__);
+        // TODO: Implement actual remote expert dispatch here
+    }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
