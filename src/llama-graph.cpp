@@ -697,7 +697,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res;
+
+    // Use distributed operation if remote experts are configured
+    if (model && model->has_remote_experts) {
+        // Store model pointer in ids tensor for compute function to access
+        ids->extra = (void*)model;
+        res = ggml_mul_mat_id_distributed(ctx0, w, cur, ids);
+    } else {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
+
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -1053,25 +1063,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
-    // Distributed MoE: Check if we need to dispatch to remote experts
-    // TODO: For a complete implementation, we need to:
-    // 1. Extract expert IDs from selected_experts tensor (currently on GPU/backend)
-    // 2. Split into local vs remote expert sets based on model->expert_endpoints
-    // 3. Create separate computation paths for local and remote experts
-    // 4. Call ggml_rpc_expert_evaluate() for remote experts
-    // 5. Merge local and remote results in the final aggregation
-    //
-    // Challenges:
-    // - selected_experts is a ggml_tensor on backend, not directly readable here
-    // - Need to split tensor operations based on runtime routing information
-    // - Current code path assumes all experts evaluated together via ggml_mul_mat_id
-    //
-    // For now, log if remote experts are configured (evaluation continues locally)
+    // Distributed MoE: Using GGML_OP_MUL_MAT_ID_DISTRIBUTED operation
+    // When model->has_remote_experts is true, build_lora_mm_id will use
+    // ggml_mul_mat_id_distributed which dispatches to remote workers at runtime.
+    // The operation's compute function has access to:
+    // - selected_experts tensor (available at execution time on backend)
+    // - model pointer (stored in tensor->extra)
+    // - model->expert_endpoints (maps expert IDs to worker endpoints)
+    // This allows runtime dispatch without compile-time graph duplication.
     if (model && model->has_remote_experts) {
-        LLAMA_LOG_WARN("%s: distributed MoE configured but remote expert dispatch not yet implemented (layer %d)\n",
+        LLAMA_LOG_INFO("%s: distributed MoE enabled for layer %d - will dispatch to remote experts at runtime\n",
                       __func__, il);
-        LLAMA_LOG_WARN("%s: all experts will be evaluated locally for now\n", __func__);
-        // TODO: Implement actual remote expert dispatch here
     }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
