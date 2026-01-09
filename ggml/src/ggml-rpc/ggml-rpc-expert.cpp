@@ -10,17 +10,24 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 
 // Global state for expert RPC
 struct expert_rpc_state {
     bool initialized = false;
+    bool shutdown_requested = false;
     std::string model_path;
     std::string expert_range;
     std::string endpoint;
     int server_socket = -1;
+    pthread_t worker_thread;
 
     // Connection pool for client-side
     std::map<std::string, int> connections;
+
+    // Evaluation callback (worker side)
+    ggml_rpc_expert_eval_callback eval_callback = nullptr;
+    void * eval_user_data = nullptr;
 };
 
 static expert_rpc_state g_expert_rpc;
@@ -122,6 +129,176 @@ static bool recv_all(int sock, void * data, size_t size) {
     return true;
 }
 
+// Forward declaration for worker thread
+static void* worker_thread_func(void* arg);
+
+// Handle a single request on the worker side
+static bool handle_single_request(int client_sock) {
+    // Receive request header
+    ggml_rpc_expert_request req;
+    if (!recv_all(client_sock, &req, sizeof(req))) {
+        fprintf(stderr, "%s: failed to receive request header\n", __func__);
+        return false;
+    }
+
+    // Validate magic and version
+    if (req.magic != GGML_RPC_EXPERT_MAGIC) {
+        fprintf(stderr, "%s: invalid magic number: 0x%08x\n", __func__, req.magic);
+
+        ggml_rpc_expert_response resp;
+        resp.magic = GGML_RPC_EXPERT_MAGIC;
+        resp.version = GGML_RPC_EXPERT_VERSION;
+        resp.status = GGML_RPC_EXPERT_STATUS_INVALID_REQ;
+        resp.n_tokens = 0;
+        resp.n_embd = 0;
+        send_all(client_sock, &resp, sizeof(resp));
+        return false;
+    }
+
+    if (req.version != GGML_RPC_EXPERT_VERSION) {
+        fprintf(stderr, "%s: unsupported version: %d\n", __func__, req.version);
+
+        ggml_rpc_expert_response resp;
+        resp.magic = GGML_RPC_EXPERT_MAGIC;
+        resp.version = GGML_RPC_EXPERT_VERSION;
+        resp.status = GGML_RPC_EXPERT_STATUS_INVALID_REQ;
+        resp.n_tokens = 0;
+        resp.n_embd = 0;
+        send_all(client_sock, &resp, sizeof(resp));
+        return false;
+    }
+
+    fprintf(stderr, "%s: received request - layer=%d, n_experts=%d, n_tokens=%d, n_embd=%d, n_ff=%d\n",
+            __func__, req.layer_id, req.n_experts, req.n_tokens, req.n_embd, req.n_ff);
+
+    // Receive expert IDs
+    std::vector<uint8_t> expert_ids(req.n_experts);
+    if (!recv_all(client_sock, expert_ids.data(), req.n_experts)) {
+        fprintf(stderr, "%s: failed to receive expert IDs\n", __func__);
+        return false;
+    }
+
+    // Receive weights
+    size_t weights_size = req.n_experts * req.n_tokens * sizeof(float);
+    std::vector<float> weights(req.n_experts * req.n_tokens);
+    if (!recv_all(client_sock, weights.data(), weights_size)) {
+        fprintf(stderr, "%s: failed to receive weights\n", __func__);
+        return false;
+    }
+
+    // Receive input data
+    size_t input_size = req.n_embd * req.n_tokens * sizeof(float);
+    std::vector<float> input_data(req.n_embd * req.n_tokens);
+    if (!recv_all(client_sock, input_data.data(), input_size)) {
+        fprintf(stderr, "%s: failed to receive input data\n", __func__);
+        return false;
+    }
+
+    fprintf(stderr, "%s: received all data, processing experts...\n", __func__);
+
+    // Allocate output buffer
+    std::vector<float> output_data(req.n_embd * req.n_tokens, 0.0f);
+
+    // Call evaluation callback if registered
+    bool eval_success = false;
+    if (g_expert_rpc.eval_callback != nullptr) {
+        fprintf(stderr, "%s: calling registered evaluation callback\n", __func__);
+        eval_success = g_expert_rpc.eval_callback(
+            g_expert_rpc.eval_user_data,
+            req.layer_id,
+            req.n_experts,
+            expert_ids.data(),
+            req.n_tokens,
+            req.n_embd,
+            req.n_ff,
+            weights.data(),
+            input_data.data(),
+            output_data.data()
+        );
+    } else {
+        fprintf(stderr, "%s: WARNING - no evaluation callback registered, returning zeros\n", __func__);
+        // Return zeros as fallback
+        eval_success = true;
+    }
+
+    if (!eval_success) {
+        fprintf(stderr, "%s: evaluation callback failed\n", __func__);
+
+        ggml_rpc_expert_response error_resp;
+        error_resp.magic = GGML_RPC_EXPERT_MAGIC;
+        error_resp.version = GGML_RPC_EXPERT_VERSION;
+        error_resp.status = GGML_RPC_EXPERT_STATUS_ERROR;
+        error_resp.n_tokens = 0;
+        error_resp.n_embd = 0;
+        send_all(client_sock, &error_resp, sizeof(error_resp));
+        return false;
+    }
+
+    // Send response header
+    ggml_rpc_expert_response resp;
+    resp.magic = GGML_RPC_EXPERT_MAGIC;
+    resp.version = GGML_RPC_EXPERT_VERSION;
+    resp.status = GGML_RPC_EXPERT_STATUS_SUCCESS;
+    resp.n_tokens = req.n_tokens;
+    resp.n_embd = req.n_embd;
+
+    if (!send_all(client_sock, &resp, sizeof(resp))) {
+        fprintf(stderr, "%s: failed to send response header\n", __func__);
+        return false;
+    }
+
+    // Send output data
+    size_t output_size = resp.n_embd * resp.n_tokens * sizeof(float);
+    if (!send_all(client_sock, output_data.data(), output_size)) {
+        fprintf(stderr, "%s: failed to send output data\n", __func__);
+        return false;
+    }
+
+    fprintf(stderr, "%s: successfully sent response (%zu bytes)\n", __func__, output_size);
+    return true;
+}
+
+// Worker thread that accepts connections and handles requests
+static void* worker_thread_func(void* arg) {
+    (void)arg;
+    fprintf(stderr, "%s: worker thread started\n", __func__);
+
+    while (!g_expert_rpc.shutdown_requested) {
+        // Accept incoming connection
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        int client_sock = accept(g_expert_rpc.server_socket,
+                                 (struct sockaddr *)&client_addr,
+                                 &client_len);
+
+        if (client_sock < 0) {
+            if (g_expert_rpc.shutdown_requested) {
+                break;
+            }
+            fprintf(stderr, "%s: accept failed: %s\n", __func__, strerror(errno));
+            continue;
+        }
+
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+        fprintf(stderr, "%s: accepted connection from %s:%d\n",
+                __func__, client_ip, ntohs(client_addr.sin_port));
+
+        // Handle multiple requests on same connection
+        while (handle_single_request(client_sock)) {
+            // Continue handling requests until client disconnects or error
+        }
+
+        close(client_sock);
+        fprintf(stderr, "%s: closed connection from %s:%d\n",
+                __func__, client_ip, ntohs(client_addr.sin_port));
+    }
+
+    fprintf(stderr, "%s: worker thread exiting\n", __func__);
+    return nullptr;
+}
+
 bool ggml_rpc_expert_init(
     const char * model_path,
     const char * expert_range,
@@ -180,8 +357,17 @@ bool ggml_rpc_expert_init(
 
     fprintf(stderr, "%s: server listening on port %d\n", __func__, port);
 
-    // TODO: Load model with only assigned experts
-    // TODO: Start worker thread to accept connections and handle requests
+    // TODO: Load model with only assigned experts (next step)
+
+    // Start worker thread to accept connections
+    g_expert_rpc.shutdown_requested = false;
+    if (pthread_create(&g_expert_rpc.worker_thread, nullptr, worker_thread_func, nullptr) != 0) {
+        fprintf(stderr, "%s: failed to create worker thread: %s\n", __func__, strerror(errno));
+        close(g_expert_rpc.server_socket);
+        return false;
+    }
+
+    fprintf(stderr, "%s: worker thread started successfully\n", __func__);
 
     g_expert_rpc.initialized = true;
     return true;
@@ -283,20 +469,40 @@ bool ggml_rpc_expert_evaluate(
     return true;
 }
 
+void ggml_rpc_expert_register_eval_callback(
+    ggml_rpc_expert_eval_callback callback,
+    void * user_data
+) {
+    fprintf(stderr, "%s: registering evaluation callback\n", __func__);
+    g_expert_rpc.eval_callback = callback;
+    g_expert_rpc.eval_user_data = user_data;
+}
+
 void ggml_rpc_expert_shutdown() {
     fprintf(stderr, "%s: shutting down expert RPC\n", __func__);
+
+    // Signal worker thread to exit
+    g_expert_rpc.shutdown_requested = true;
+
+    // Close server socket to unblock accept()
+    if (g_expert_rpc.server_socket >= 0) {
+        shutdown(g_expert_rpc.server_socket, SHUT_RDWR);
+        close(g_expert_rpc.server_socket);
+        g_expert_rpc.server_socket = -1;
+    }
+
+    // Wait for worker thread to finish
+    if (g_expert_rpc.initialized) {
+        fprintf(stderr, "%s: waiting for worker thread to exit...\n", __func__);
+        pthread_join(g_expert_rpc.worker_thread, nullptr);
+        fprintf(stderr, "%s: worker thread joined\n", __func__);
+    }
 
     // Close all client connections
     for (auto & conn : g_expert_rpc.connections) {
         close(conn.second);
     }
     g_expert_rpc.connections.clear();
-
-    // Close server socket
-    if (g_expert_rpc.server_socket >= 0) {
-        close(g_expert_rpc.server_socket);
-        g_expert_rpc.server_socket = -1;
-    }
 
     g_expert_rpc.initialized = false;
 }

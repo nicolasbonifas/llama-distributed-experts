@@ -50,11 +50,33 @@ struct ggml_rpc_expert_response {
     // - float weighted_output[n_embd * n_tokens] (if status == 0)
 };
 
+// Callback function type for expert evaluation on worker side
+// This allows the application layer (llama.cpp) to provide the actual
+// expert evaluation logic while keeping ggml layer independent
+typedef bool (*ggml_rpc_expert_eval_callback)(
+    void * user_data,           // User context (e.g., llama_model*)
+    uint8_t layer_id,
+    uint8_t n_experts,
+    const uint8_t * expert_ids,
+    uint16_t n_tokens,
+    uint32_t n_embd,
+    uint32_t n_ff,
+    const float * weights,
+    const float * input_data,
+    float * output_data
+);
+
 // Initialize expert RPC for a model (called once at startup)
 GGML_BACKEND_API bool ggml_rpc_expert_init(
     const char * model_path,
     const char * expert_range,  // e.g., "0-31"
     const char * endpoint       // e.g., "0.0.0.0:50052"
+);
+
+// Register evaluation callback (worker side only)
+GGML_BACKEND_API void ggml_rpc_expert_register_eval_callback(
+    ggml_rpc_expert_eval_callback callback,
+    void * user_data
 );
 
 // Evaluate experts on worker node (synchronous call)

@@ -495,6 +495,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID_DISTRIBUTED,  // Distributed expert evaluation for MoE
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1407,6 +1408,14 @@ extern "C" {
 
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    // distributed indirect matrix multiplication (for distributed MoE experts)
+    // same interface as ggml_mul_mat_id, but dispatches to remote workers when needed
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_distributed(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
