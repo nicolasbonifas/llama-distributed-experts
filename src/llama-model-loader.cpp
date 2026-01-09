@@ -816,6 +816,12 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
 
 struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx, const std::string & name, const std::initializer_list<int64_t> & ne, int flags) {
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, name.c_str());
+
+    // TODO: Selective expert tensor loading optimization
+    // Currently expert tensors are stored in merged/concatenated form,
+    // so we load all experts and handle distribution at inference time in build_moe_ffn
+    // Future optimization: split merged expert tensors and only load assigned slices
+
     const struct ggml_tensor * cur = check_tensor_dims(name, ne, !(flags & TENSOR_NOT_REQUIRED));
 
     if (cur == NULL) {

@@ -2023,6 +2023,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 GGML_UNUSED(params);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--expert-worker-mode"}, "RANGE",
+            "run as expert worker node, serving specified expert range\n"
+            "  example: --expert-worker-mode \"0-31\" loads only experts 0-31",
+            [](common_params & params, const std::string & value) {
+                params.expert_worker_mode = true;
+                params.expert_worker_range = value;
+            }
+        ));
+        add_opt(common_arg(
+            {"--expert-rpc-servers"}, "SERVERS",
+            "RPC servers with expert ranges for distributed MoE evaluation\n"
+            "  format: host:port:expert_range[,host:port:expert_range...]\n"
+            "  example: --expert-rpc-servers \"192.168.1.10:50052:0-31,192.168.1.11:50052:32-63\"",
+            [](common_params & params, const std::string & value) {
+                params.expert_rpc_servers = value;
+            }
+        ));
     }
     add_opt(common_arg(
         {"--mlock"},

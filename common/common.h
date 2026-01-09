@@ -560,6 +560,11 @@ struct common_params {
     bool has_speculative() const {
         return !speculative.model.path.empty() || !speculative.model.hf_repo.empty();
     }
+
+    // distributed MoE expert evaluation
+    bool expert_worker_mode = false;         // run as expert worker node
+    std::string expert_worker_range = "";    // expert range to handle (e.g., "0-31")
+    std::string expert_rpc_servers = "";     // RPC servers with expert ranges (e.g., "host:port:0-31,host:port:32-63")
 };
 
 // call once at the start of a program if it uses libcommon
@@ -572,6 +577,11 @@ bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREA
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(cpu_params & cpuparams, const cpu_params * role_model = nullptr);
 bool set_process_priority(enum ggml_sched_priority prio);
+
+// expert distribution utilities
+std::set<int> parse_expert_range(const std::string & range);  // parse "0-31" or "0,5,10"
+bool is_expert_tensor(const std::string & name);              // check if tensor is an expert tensor
+int parse_expert_id_from_tensor_name(const std::string & name); // extract expert ID from tensor name (returns -1 if not expert tensor)
 
 //
 // String utils

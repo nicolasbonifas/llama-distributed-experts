@@ -58,6 +58,7 @@ add_library(${TARGET} STATIC
     chat.h
     common.cpp
     common.h
+    common-expert.cpp
     console.cpp
     console.h
     download.cpp
