@@ -16,3 +16,9 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
+
+# Test program for expert RPC protocol
+set(TARGET test-expert-rpc)
+add_executable(${TARGET} test-expert-rpc.cpp)
+target_link_libraries(${TARGET} PRIVATE ggml)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
