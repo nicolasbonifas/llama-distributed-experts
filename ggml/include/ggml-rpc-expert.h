@@ -96,6 +96,18 @@ GGML_BACKEND_API bool ggml_rpc_expert_evaluate(
 // Cleanup
 GGML_BACKEND_API void ggml_rpc_expert_shutdown();
 
+// Master-side distributed dispatch helper
+// This function handles the logic of splitting local vs remote experts
+// and dispatching appropriately. Called from ggml_compute_forward_mul_mat_id_distributed.
+GGML_BACKEND_API bool ggml_rpc_expert_dispatch_mul_mat_id(
+    const struct ggml_tensor * ids,      // Expert IDs tensor (int32)
+    const struct ggml_tensor * weights,  // Expert weights tensor
+    const struct ggml_tensor * input,    // Input tensor
+    struct ggml_tensor * output,         // Output tensor (result)
+    void * model_ptr,                    // llama_model pointer (opaque to ggml)
+    int layer_id                         // Layer ID for logging/dispatch
+);
+
 #ifdef __cplusplus
 }
 #endif

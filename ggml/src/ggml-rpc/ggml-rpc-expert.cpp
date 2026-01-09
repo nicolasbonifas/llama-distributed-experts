@@ -506,3 +506,42 @@ void ggml_rpc_expert_shutdown() {
 
     g_expert_rpc.initialized = false;
 }
+
+bool ggml_rpc_expert_dispatch_mul_mat_id(
+    const struct ggml_tensor * ids,
+    const struct ggml_tensor * weights,
+    const struct ggml_tensor * input,
+    struct ggml_tensor * output,
+    void * model_ptr,
+    int layer_id
+) {
+    // This function handles distributed dispatch for MoE expert evaluation
+    // Called from ggml_compute_forward_mul_mat_id_distributed at execution time
+
+    if (model_ptr == nullptr) {
+        fprintf(stderr, "%s: no model pointer provided, cannot dispatch\n", __func__);
+        return false;
+    }
+
+    fprintf(stderr, "%s: distributed dispatch for layer %d\n", __func__, layer_id);
+    fprintf(stderr, "%s: ids shape: [%lld, %lld, %lld, %lld]\n", __func__,
+            ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3]);
+    fprintf(stderr, "%s: input shape: [%lld, %lld, %lld, %lld]\n", __func__,
+            input->ne[0], input->ne[1], input->ne[2], input->ne[3]);
+    fprintf(stderr, "%s: output shape: [%lld, %lld, %lld, %lld]\n", __func__,
+            output->ne[0], output->ne[1], output->ne[2], output->ne[3]);
+
+    // TODO: Implement actual distributed dispatch logic
+    // For now, this is a stub that demonstrates the call path
+    // Next steps:
+    // 1. Read expert IDs from ids tensor (data is available at execution time)
+    // 2. Use callback/interface to lookup which experts are remote
+    // 3. Group experts by endpoint
+    // 4. Call ggml_rpc_expert_evaluate() for remote expert groups
+    // 5. Handle local experts separately
+    // 6. Merge results into output tensor
+
+    fprintf(stderr, "%s: WARNING - actual dispatch not yet implemented, will use local evaluation\n", __func__);
+    return false;  // Returning false causes fallback to regular mul_mat_id
+}
+

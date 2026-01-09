@@ -14,6 +14,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-rpc-expert.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1809,9 +1810,27 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID_DISTRIBUTED:
             {
-                // For now, fall back to regular mul_mat_id
-                // TODO: Implement actual distributed dispatch logic
-                ggml_compute_forward_mul_mat_id(params, tensor);
+                // Try distributed dispatch first
+                const struct ggml_tensor * ids = tensor->src[2];
+                void * model_ptr = ids->extra;  // Model pointer stored by build_lora_mm_id
+
+                // Extract layer_id from params or default to 0
+                // TODO: Pass actual layer_id through tensor metadata
+                int layer_id = 0;
+
+                bool dispatched = ggml_rpc_expert_dispatch_mul_mat_id(
+                    ids,           // Expert IDs
+                    tensor->src[0], // Weights
+                    tensor->src[1], // Input
+                    tensor,        // Output
+                    model_ptr,     // Model pointer
+                    layer_id       // Layer ID
+                );
+
+                // If dispatch failed or returned false, fall back to local evaluation
+                if (!dispatched) {
+                    ggml_compute_forward_mul_mat_id(params, tensor);
+                }
             } break;
         case GGML_OP_OUT_PROD:
             {
