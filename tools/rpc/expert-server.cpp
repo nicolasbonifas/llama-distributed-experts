@@ -79,6 +79,60 @@ static bool expert_server_params_parse(int argc, char ** argv, expert_server_par
     return true;
 }
 
+// Simple evaluation callback for testing
+// In production, this would load the model and do actual FFN computation
+static bool simple_eval_callback(
+    void * user_data,
+    uint8_t layer_id,
+    uint8_t n_experts,
+    const uint8_t * expert_ids,
+    uint16_t n_tokens,
+    uint32_t n_embd,
+    uint32_t n_ff,
+    const float * weights,
+    const float * input_data,
+    float * output_data
+) {
+    (void)user_data;
+    (void)n_ff;
+
+    fprintf(stderr, "simple_eval_callback: layer=%d, n_experts=%d, n_tokens=%d, n_embd=%d\n",
+            layer_id, n_experts, n_tokens, n_embd);
+
+    fprintf(stderr, "simple_eval_callback: evaluating experts: ");
+    for (int i = 0; i < n_experts; i++) {
+        fprintf(stderr, "%d ", expert_ids[i]);
+    }
+    fprintf(stderr, "\n");
+
+    // Simple demonstration: apply weighted pass-through
+    // In production, this would be: up -> gate -> down FFN computation
+    // For now, we just apply the expert weights to show the system works
+
+    size_t output_size = n_embd * n_tokens;
+
+    // Initialize output to zero
+    for (size_t i = 0; i < output_size; i++) {
+        output_data[i] = 0.0f;
+    }
+
+    // For each expert, add weighted input to output
+    for (int e = 0; e < n_experts; e++) {
+        float expert_weight = weights[e];  // Simplified: using first weight for each expert
+
+        fprintf(stderr, "simple_eval_callback: expert %d weight: %.4f\n",
+                expert_ids[e], expert_weight);
+
+        // Add weighted input to output
+        for (size_t i = 0; i < output_size; i++) {
+            output_data[i] += expert_weight * input_data[i];
+        }
+    }
+
+    fprintf(stderr, "simple_eval_callback: evaluation complete\n");
+    return true;
+}
+
 int main(int argc, char * argv[]) {
     ggml_backend_load_all();
 
@@ -131,12 +185,20 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
+    // Register evaluation callback
+    // TODO: In production, load model and use real FFN evaluation
+    ggml_rpc_expert_register_eval_callback(simple_eval_callback, nullptr);
+    fprintf(stderr, "Registered simple evaluation callback (weighted pass-through)\n");
+
     fprintf(stderr, "Expert worker initialized successfully\n");
     fprintf(stderr, "Listening on %s...\n", endpoint.c_str());
     fprintf(stderr, "Press Ctrl+C to stop\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "NOTE: Using simple demonstration callback\n");
+    fprintf(stderr, "      For production use, implement actual FFN evaluation\n");
+    fprintf(stderr, "\n");
 
-    // TODO: Start RPC server loop here
-    // For now, just block forever
+    // Server loop - worker thread handles requests
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }

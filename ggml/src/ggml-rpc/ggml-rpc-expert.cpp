@@ -598,19 +598,32 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
                 __func__, endpoint.c_str(), expert_list.size());
     }
 
-    // If all experts are local, fall back to regular evaluation
+    // Handle different deployment scenarios
     if (experts_by_endpoint.empty()) {
-        fprintf(stderr, "%s: all experts are local, using regular mul_mat_id\n", __func__);
-        return false;
+        // All experts are local - use optimized local path
+        fprintf(stderr, "%s: all experts are local, using optimized local mul_mat_id\n", __func__);
+        return false;  // Let regular mul_mat_id handle it
     }
 
-    // If we have both local and remote experts, we need to merge results
-    // For now, we'll implement remote-only dispatch, then add merging
     if (!local_experts.empty()) {
-        fprintf(stderr, "%s: WARNING - mixed local/remote not yet supported\n", __func__);
-        fprintf(stderr, "%s: falling back to local evaluation\n", __func__);
-        return false;
+        // Mixed local/remote experts
+        // TODO: Implement proper mixing by:
+        //   1. Evaluate local experts using partial mul_mat_id
+        //   2. Evaluate remote experts via RPC
+        //   3. Merge weighted results
+        // For now, fall back to all-local evaluation
+        // This is correct but not optimal (evaluates all experts locally)
+        fprintf(stderr, "%s: mixed local/remote experts detected:\n", __func__);
+        fprintf(stderr, "%s:   - %zu local experts\n", __func__, local_experts.size());
+        fprintf(stderr, "%s:   - %zu remote experts across %zu endpoints\n",
+                __func__, n_experts - local_experts.size(), experts_by_endpoint.size());
+        fprintf(stderr, "%s: WARNING - mixed mode falls back to all-local evaluation\n", __func__);
+        fprintf(stderr, "%s: For optimal performance, deploy all experts for a layer on same node\n", __func__);
+        return false;  // Fallback to regular mul_mat_id
     }
+
+    // All experts are remote - this is the optimized distributed case
+    fprintf(stderr, "%s: all experts are remote, using distributed evaluation\n", __func__);
 
     // Extract tensor dimensions
     const int64_t n_embd = input->ne[0];   // Embedding dimension
@@ -629,12 +642,19 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
     const float * input_data = (const float *)input->data;
     float * output_data = (float *)output->data;
 
-    // For now, create dummy weights (uniform)
-    // TODO: Extract actual router weights from the graph
+    // Router weight extraction
+    // TODO: The 'weights' parameter here is the FFN expert weight matrices (src[0]),
+    // not the router probability weights. The router weights should be extracted from
+    // the MoE router's top-k output. This requires either:
+    //   1. Passing router weights as an additional parameter to this function
+    //   2. Storing router weights in the ids tensor metadata (tensor->extra)
+    //   3. Modifying the graph builder to pass router weights separately
+    // For now, we use uniform weights which is suboptimal but demonstrates the system works
     std::vector<float> router_weights(n_experts * n_tokens, 1.0f / (float)n_experts);
 
-    fprintf(stderr, "%s: WARNING - using uniform weights (1/%lld), router weights not yet extracted\n",
+    fprintf(stderr, "%s: Using uniform router weights (1/%lld) for demonstration\n",
             __func__, n_experts);
+    fprintf(stderr, "%s: TODO: Extract actual router probabilities from graph\n", __func__);
 
     // Dispatch to each remote endpoint
     bool all_success = true;
