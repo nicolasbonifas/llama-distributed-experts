@@ -531,6 +531,22 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
     // This function handles distributed dispatch for MoE expert evaluation
     // Called from ggml_compute_forward_mul_mat_id_distributed at execution time
 
+    // Extract model pointer and router weights from context struct
+    struct distributed_moe_ctx {
+        void * model_ptr;
+        struct ggml_tensor * router_weights;
+    };
+
+    distributed_moe_ctx * ctx = nullptr;
+    struct ggml_tensor * router_weights_tensor = nullptr;
+
+    if (model_ptr != nullptr) {
+        // New path: model_ptr points to distributed_moe_ctx struct
+        ctx = (distributed_moe_ctx *)model_ptr;
+        model_ptr = ctx->model_ptr;
+        router_weights_tensor = ctx->router_weights;
+    }
+
     if (model_ptr == nullptr) {
         fprintf(stderr, "%s: no model pointer provided, cannot dispatch\n", __func__);
         return false;
@@ -607,18 +623,42 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
 
     if (!local_experts.empty()) {
         // Mixed local/remote experts
-        // TODO: Implement proper mixing by:
-        //   1. Evaluate local experts using partial mul_mat_id
-        //   2. Evaluate remote experts via RPC
-        //   3. Merge weighted results
-        // For now, fall back to all-local evaluation
-        // This is correct but not optimal (evaluates all experts locally)
-        fprintf(stderr, "%s: mixed local/remote experts detected:\n", __func__);
-        fprintf(stderr, "%s:   - %zu local experts\n", __func__, local_experts.size());
-        fprintf(stderr, "%s:   - %zu remote experts across %zu endpoints\n",
+        // This is a complex case that requires:
+        //   1. Computing FFN for local experts directly
+        //   2. Making RPC calls for remote experts
+        //   3. Merging weighted results
+        //
+        // Implementation approaches:
+        //   A) Direct FFN computation for local experts (requires access to expert weights)
+        //   B) Recursive mul_mat_id call with subset of experts (requires tensor creation)
+        //   C) Graph-time separation of local/remote paths (requires graph builder changes)
+        //
+        // For now, we have three options:
+        //   1. Fall back to all-local (safe, works, but defeats the purpose)
+        //   2. Implement direct FFN for local + RPC for remote (complex, best)
+        //   3. Fail and require all-local or all-remote deployment (restrictive)
+        //
+        // Current implementation: Fall back to all-local with detailed warning
+
+        fprintf(stderr, "%s: ========================================\n", __func__);
+        fprintf(stderr, "%s: MIXED LOCAL/REMOTE EXPERT DEPLOYMENT DETECTED\n", __func__);
+        fprintf(stderr, "%s: ========================================\n", __func__);
+        fprintf(stderr, "%s: Layer %d expert distribution:\n", __func__, layer_id);
+        fprintf(stderr, "%s:   - Local experts:  %zu\n", __func__, local_experts.size());
+        fprintf(stderr, "%s:   - Remote experts: %zu across %zu endpoints\n",
                 __func__, n_experts - local_experts.size(), experts_by_endpoint.size());
-        fprintf(stderr, "%s: WARNING - mixed mode falls back to all-local evaluation\n", __func__);
-        fprintf(stderr, "%s: For optimal performance, deploy all experts for a layer on same node\n", __func__);
+        fprintf(stderr, "%s:\n", __func__);
+        fprintf(stderr, "%s: CURRENT BEHAVIOR: Falling back to all-local evaluation\n", __func__);
+        fprintf(stderr, "%s:   - All experts (including remote) will be evaluated locally\n", __func__);
+        fprintf(stderr, "%s:   - This works correctly but misses the distributed benefits\n", __func__);
+        fprintf(stderr, "%s:\n", __func__);
+        fprintf(stderr, "%s: RECOMMENDATIONS:\n", __func__);
+        fprintf(stderr, "%s:   1. BEST: Deploy all experts for each layer on the same node\n", __func__);
+        fprintf(stderr, "%s:      Example: Layer 0 all-local, Layer 1 all-remote\n", __func__);
+        fprintf(stderr, "%s:   2. ALTERNATIVE: Implement direct FFN evaluation for local experts\n", __func__);
+        fprintf(stderr, "%s:      (See TODO in ggml-rpc-expert.cpp for implementation details)\n", __func__);
+        fprintf(stderr, "%s: ========================================\n", __func__);
+
         return false;  // Fallback to regular mul_mat_id
     }
 
@@ -643,18 +683,36 @@ bool ggml_rpc_expert_dispatch_mul_mat_id(
     float * output_data = (float *)output->data;
 
     // Router weight extraction
-    // TODO: The 'weights' parameter here is the FFN expert weight matrices (src[0]),
-    // not the router probability weights. The router weights should be extracted from
-    // the MoE router's top-k output. This requires either:
-    //   1. Passing router weights as an additional parameter to this function
-    //   2. Storing router weights in the ids tensor metadata (tensor->extra)
-    //   3. Modifying the graph builder to pass router weights separately
-    // For now, we use uniform weights which is suboptimal but demonstrates the system works
-    std::vector<float> router_weights(n_experts * n_tokens, 1.0f / (float)n_experts);
+    std::vector<float> router_weights;
 
-    fprintf(stderr, "%s: Using uniform router weights (1/%lld) for demonstration\n",
-            __func__, n_experts);
-    fprintf(stderr, "%s: TODO: Extract actual router probabilities from graph\n", __func__);
+    if (router_weights_tensor != nullptr && router_weights_tensor->data != nullptr) {
+        // Extract actual router probabilities from the tensor
+        // Router weights tensor shape: [1, n_expert_used, n_tokens]
+        const float * router_data = (const float *)router_weights_tensor->data;
+        const int64_t router_n_experts = router_weights_tensor->ne[1];
+        const int64_t router_n_tokens = router_weights_tensor->ne[2];
+
+        fprintf(stderr, "%s: Extracting router weights from tensor: [%lld, %lld, %lld]\n",
+                __func__, router_weights_tensor->ne[0], router_n_experts, router_n_tokens);
+
+        // Copy router weights for selected experts
+        router_weights.resize(n_experts * n_tokens);
+        for (int64_t t = 0; t < n_tokens; t++) {
+            for (int64_t e = 0; e < n_experts; e++) {
+                // Router weights are in shape [1, n_expert_used, n_tokens]
+                // Index: [0, expert_idx, token_idx]
+                router_weights[e * n_tokens + t] = router_data[e * n_tokens + t];
+            }
+        }
+
+        fprintf(stderr, "%s: Successfully extracted %zu router weights\n",
+                __func__, router_weights.size());
+    } else {
+        // Fallback to uniform weights if router weights not available
+        fprintf(stderr, "%s: WARNING - router weights not available, using uniform weights (1/%lld)\n",
+                __func__, n_experts);
+        router_weights.resize(n_experts * n_tokens, 1.0f / (float)n_experts);
+    }
 
     // Dispatch to each remote endpoint
     bool all_success = true;

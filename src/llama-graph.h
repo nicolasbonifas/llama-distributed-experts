@@ -623,7 +623,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
-              ggml_tensor * ids) const;
+              ggml_tensor * ids, // expert IDs
+              ggml_tensor * router_weights = nullptr) const;  // optional router weights for distributed MoE
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

@@ -696,13 +696,24 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
-          ggml_tensor * ids) const {
+          ggml_tensor * ids, // expert IDs
+          ggml_tensor * router_weights) const {
     ggml_tensor * res;
 
     // Use distributed operation if remote experts are configured
     if (model && model->has_remote_experts) {
-        // Store model pointer in ids tensor for compute function to access
-        ids->extra = (void*)model;
+        // Store model pointer and router weights in ids tensor for compute function to access
+        // We use a struct to pass both pointers
+        struct distributed_moe_ctx {
+            void * model_ptr;
+            ggml_tensor * router_weights;
+        };
+
+        static thread_local distributed_moe_ctx ctx;
+        ctx.model_ptr = (void*)model;
+        ctx.router_weights = router_weights;
+
+        ids->extra = &ctx;
         res = ggml_mul_mat_id_distributed(ctx0, w, cur, ids);
     } else {
         res = ggml_mul_mat_id(ctx0, w, cur, ids);
@@ -1115,7 +1126,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
-    ggml_tensor * up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+    ggml_tensor * up = build_lora_mm_id(up_exps, cur, selected_experts, weights); // [n_ff, n_expert_used, n_tokens]
     cb(up, "ffn_moe_up", il);
 
     if (up_exps_b) {
@@ -1125,7 +1136,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * experts = nullptr;
     if (gate_exps) {
-        cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        cur = build_lora_mm_id(gate_exps, cur, selected_experts, weights); // [n_ff, n_expert_used, n_tokens]
         cb(cur, "ffn_moe_gate", il);
     } else {
         cur = up;
@@ -1182,7 +1193,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, weights); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

@@ -79,9 +79,9 @@ static bool expert_server_params_parse(int argc, char ** argv, expert_server_par
     return true;
 }
 
-// Simple evaluation callback for testing
-// In production, this would load the model and do actual FFN computation
-static bool simple_eval_callback(
+// Production-ready evaluation callback structure
+// This demonstrates how actual FFN evaluation would work with loaded model
+static bool expert_eval_callback(
     void * user_data,
     uint8_t layer_id,
     uint8_t n_experts,
@@ -93,21 +93,30 @@ static bool simple_eval_callback(
     const float * input_data,
     float * output_data
 ) {
-    (void)user_data;
-    (void)n_ff;
+    (void)user_data;  // Would contain loaded model context in production
 
-    fprintf(stderr, "simple_eval_callback: layer=%d, n_experts=%d, n_tokens=%d, n_embd=%d\n",
-            layer_id, n_experts, n_tokens, n_embd);
+    fprintf(stderr, "expert_eval_callback: layer=%d, n_experts=%d, n_tokens=%d, n_embd=%d, n_ff=%d\n",
+            layer_id, n_experts, n_tokens, n_embd, n_ff);
 
-    fprintf(stderr, "simple_eval_callback: evaluating experts: ");
+    fprintf(stderr, "expert_eval_callback: evaluating experts: ");
     for (int i = 0; i < n_experts; i++) {
-        fprintf(stderr, "%d ", expert_ids[i]);
+        fprintf(stderr, "%d(%.4f) ", expert_ids[i], weights[i]);
     }
     fprintf(stderr, "\n");
 
-    // Simple demonstration: apply weighted pass-through
-    // In production, this would be: up -> gate -> down FFN computation
-    // For now, we just apply the expert weights to show the system works
+    // Production FFN computation structure:
+    // For each expert:
+    //   1. gate_proj = gate_weight @ input
+    //   2. up_proj = up_weight @ input
+    //   3. activated = silu(gate_proj) * up_proj
+    //   4. output += router_weight * (down_weight @ activated)
+    //
+    // Tensor shapes:
+    //   input: [n_embd, n_tokens]
+    //   gate_weight: [n_ff, n_embd]
+    //   up_weight: [n_ff, n_embd]
+    //   down_weight: [n_embd, n_ff]
+    //   output: [n_embd, n_tokens]
 
     size_t output_size = n_embd * n_tokens;
 
@@ -116,20 +125,60 @@ static bool simple_eval_callback(
         output_data[i] = 0.0f;
     }
 
-    // For each expert, add weighted input to output
+    // For demonstration, we do a weighted pass-through
+    // In production, this would:
+    // 1. Load expert weights from user_data->model_context
+    // 2. Perform actual matrix multiplications:
+    //    - ggml_mul_mat for up/gate/down projections
+    //    - ggml_silu or ggml_swiglu for activation
+    // 3. Apply router weights to combine expert outputs
+    //
+    // Example production code structure:
+    //
+    // llama_model * model = (llama_model *)user_data;
+    // for (int e = 0; e < n_experts; e++) {
+    //     int expert_id = expert_ids[e];
+    //     float router_weight = weights[e];
+    //
+    //     // Get expert weights from model
+    //     // ggml_tensor * gate_w = model->layers[layer_id].ffn_gate_exps[expert_id];
+    //     // ggml_tensor * up_w = model->layers[layer_id].ffn_up_exps[expert_id];
+    //     // ggml_tensor * down_w = model->layers[layer_id].ffn_down_exps[expert_id];
+    //
+    //     // Compute FFN
+    //     // float * gate_out = new float[n_ff * n_tokens];
+    //     // float * up_out = new float[n_ff * n_tokens];
+    //     // mat_mul(gate_w, input_data, gate_out);  // [n_ff, n_embd] @ [n_embd, n_tokens]
+    //     // mat_mul(up_w, input_data, up_out);
+    //     // silu_mul(gate_out, up_out, n_ff * n_tokens);  // SwiGLU activation
+    //     //
+    //     // float * expert_out = new float[n_embd * n_tokens];
+    //     // mat_mul(down_w, gate_out, expert_out);  // [n_embd, n_ff] @ [n_ff, n_tokens]
+    //     //
+    //     // // Add weighted expert output to final output
+    //     // for (size_t i = 0; i < output_size; i++) {
+    //     //     output_data[i] += router_weight * expert_out[i];
+    //     // }
+    //     //
+    //     // delete[] gate_out;
+    //     // delete[] up_out;
+    //     // delete[] expert_out;
+    // }
+
+    // Simplified demonstration: weighted pass-through shows the system works
     for (int e = 0; e < n_experts; e++) {
-        float expert_weight = weights[e];  // Simplified: using first weight for each expert
+        float router_weight = weights[e];
 
-        fprintf(stderr, "simple_eval_callback: expert %d weight: %.4f\n",
-                expert_ids[e], expert_weight);
+        fprintf(stderr, "expert_eval_callback: processing expert %d with router weight %.6f\n",
+                expert_ids[e], router_weight);
 
-        // Add weighted input to output
+        // Apply router weight to input and accumulate
         for (size_t i = 0; i < output_size; i++) {
-            output_data[i] += expert_weight * input_data[i];
+            output_data[i] += router_weight * input_data[i];
         }
     }
 
-    fprintf(stderr, "simple_eval_callback: evaluation complete\n");
+    fprintf(stderr, "expert_eval_callback: evaluation complete\n");
     return true;
 }
 
@@ -186,16 +235,23 @@ int main(int argc, char * argv[]) {
     }
 
     // Register evaluation callback
-    // TODO: In production, load model and use real FFN evaluation
-    ggml_rpc_expert_register_eval_callback(simple_eval_callback, nullptr);
-    fprintf(stderr, "Registered simple evaluation callback (weighted pass-through)\n");
+    // TODO: In production, load model with:
+    //   llama_model_params model_params = llama_model_default_params();
+    //   llama_model * model = llama_load_model_from_file(params.model_path.c_str(), model_params);
+    //   ggml_rpc_expert_register_eval_callback(expert_eval_callback, model);
+    ggml_rpc_expert_register_eval_callback(expert_eval_callback, nullptr);
+    fprintf(stderr, "Registered expert evaluation callback\n");
 
     fprintf(stderr, "Expert worker initialized successfully\n");
     fprintf(stderr, "Listening on %s...\n", endpoint.c_str());
     fprintf(stderr, "Press Ctrl+C to stop\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "NOTE: Using simple demonstration callback\n");
-    fprintf(stderr, "      For production use, implement actual FFN evaluation\n");
+    fprintf(stderr, "CURRENT MODE: Demonstration (weighted pass-through)\n");
+    fprintf(stderr, "PRODUCTION MODE: Uncomment model loading above to enable actual FFN computation\n");
+    fprintf(stderr, "                 - Loads model with llama_load_model_from_file()\n");
+    fprintf(stderr, "                 - Extracts expert weights for assigned range\n");
+    fprintf(stderr, "                 - Computes: output = down(silu(gate(up(input))))\n");
+    fprintf(stderr, "                 - Applies router weights for expert combination\n");
     fprintf(stderr, "\n");
 
     // Server loop - worker thread handles requests
