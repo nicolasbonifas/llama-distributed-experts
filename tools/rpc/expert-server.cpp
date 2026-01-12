@@ -244,12 +244,19 @@ static expert_weights_context * load_expert_weights(
 
     fprintf(stderr, "load_expert_weights: loaded %d expert weight tensors\n", loaded_count);
 
-    ctx->has_model_weights = (loaded_count > 0);
-
-    if (!ctx->has_model_weights) {
-        fprintf(stderr, "load_expert_weights: WARNING - no expert weights found in model\n");
-        fprintf(stderr, "load_expert_weights: will use synthetic weights for testing\n");
+    if (loaded_count == 0) {
+        fprintf(stderr, "load_expert_weights: ERROR - no expert weights found in model\n");
+        fprintf(stderr, "load_expert_weights: model must contain MoE expert layers\n");
+        ggml_free(ctx->ggml_ctx);
+        delete ctx;
+        return nullptr;
     }
+
+    ctx->has_model_weights = true;
+    fprintf(stderr, "load_expert_weights: successfully loaded expert weights\n");
+    fprintf(stderr, "  - Gate weights: %zu entries\n", ctx->gate_weights.size());
+    fprintf(stderr, "  - Up weights:   %zu entries\n", ctx->up_weights.size());
+    fprintf(stderr, "  - Down weights: %zu entries\n", ctx->down_weights.size());
 
     return ctx;
 }
@@ -299,79 +306,50 @@ static bool expert_eval_callback(
         fprintf(stderr, "expert_eval_callback: computing FFN for expert %d (weight=%.6f)\n",
                 expert_id, router_weight);
 
-        // Get weights from loaded model or use synthetic weights
+        // Get weights from loaded model
         auto * weights_ctx = (expert_weights_context *)user_data;
 
-        std::vector<float> gate_w(n_ff * n_embd);
-        std::vector<float> up_w(n_ff * n_embd);
-        std::vector<float> down_w(n_embd * n_ff);
-
-        if (weights_ctx && weights_ctx->has_model_weights) {
-            // Use actual model weights
-            auto key = std::make_pair((int)layer_id, expert_id);
-
-            auto gate_it = weights_ctx->gate_weights.find(key);
-            auto up_it = weights_ctx->up_weights.find(key);
-            auto down_it = weights_ctx->down_weights.find(key);
-
-            if (gate_it != weights_ctx->gate_weights.end() &&
-                up_it != weights_ctx->up_weights.end() &&
-                down_it != weights_ctx->down_weights.end()) {
-
-                // Extract expert weights from tensors
-                // Tensors are typically [n_expert, n_ff, n_embd] or similar
-                // We need to index into them to get this specific expert's weights
-
-                struct ggml_tensor * gate_tensor = gate_it->second;
-                struct ggml_tensor * up_tensor = up_it->second;
-                struct ggml_tensor * down_tensor = down_it->second;
-
-                // Get tensor data pointers
-                float * gate_data = (float *)gate_tensor->data;
-                float * up_data = (float *)up_tensor->data;
-                float * down_data = (float *)down_tensor->data;
-
-                // For expert-specific tensors, the layout depends on the model
-                // Common layouts:
-                // - If ne[2] == n_expert: [n_embd, n_ff, n_expert] -> index by expert_id
-                // - If ne[0] is large: might be flattened [n_expert * n_ff * n_embd]
-
-                // For now, assume the tensor data is for this specific expert
-                // Copy the weights
-                size_t gate_up_size = n_ff * n_embd;
-                size_t down_size = n_embd * n_ff;
-
-                memcpy(gate_w.data(), gate_data, gate_up_size * sizeof(float));
-                memcpy(up_w.data(), up_data, gate_up_size * sizeof(float));
-                memcpy(down_w.data(), down_data, down_size * sizeof(float));
-
-                fprintf(stderr, "expert_eval_callback: using actual model weights for expert %d\n", expert_id);
-            } else {
-                fprintf(stderr, "expert_eval_callback: WARNING - weights not found for expert %d, using synthetic\n", expert_id);
-                // Fall back to synthetic weights
-                for (size_t i = 0; i < n_ff * n_embd; i++) {
-                    float val = 0.1f * sinf((float)(i + expert_id * 1000));
-                    gate_w[i] = val;
-                    up_w[i] = val * 0.8f;
-                }
-                for (size_t i = 0; i < n_embd * n_ff; i++) {
-                    float val = 0.1f * cosf((float)(i + expert_id * 1000));
-                    down_w[i] = val;
-                }
-            }
-        } else {
-            // Use synthetic weights for testing
-            fprintf(stderr, "expert_eval_callback: using synthetic weights (no model loaded)\n");
-            for (size_t i = 0; i < n_ff * n_embd; i++) {
-                float val = 0.1f * sinf((float)(i + expert_id * 1000));
-                gate_w[i] = val;
-                up_w[i] = val * 0.8f;
-            }
-            for (size_t i = 0; i < n_embd * n_ff; i++) {
-                float val = 0.1f * cosf((float)(i + expert_id * 1000));
-                down_w[i] = val;
-            }
+        if (!weights_ctx || !weights_ctx->has_model_weights) {
+            fprintf(stderr, "expert_eval_callback: ERROR - no model weights loaded\n");
+            return false;
         }
+
+        auto key = std::make_pair((int)layer_id, expert_id);
+
+        auto gate_it = weights_ctx->gate_weights.find(key);
+        auto up_it = weights_ctx->up_weights.find(key);
+        auto down_it = weights_ctx->down_weights.find(key);
+
+        if (gate_it == weights_ctx->gate_weights.end() ||
+            up_it == weights_ctx->up_weights.end() ||
+            down_it == weights_ctx->down_weights.end()) {
+            fprintf(stderr, "expert_eval_callback: ERROR - weights not found for layer %d, expert %d\n",
+                    layer_id, expert_id);
+            return false;
+        }
+
+        // Extract expert weights from tensors
+        struct ggml_tensor * gate_tensor = gate_it->second;
+        struct ggml_tensor * up_tensor = up_it->second;
+        struct ggml_tensor * down_tensor = down_it->second;
+
+        // Get tensor data pointers
+        float * gate_data = (float *)gate_tensor->data;
+        float * up_data = (float *)up_tensor->data;
+        float * down_data = (float *)down_tensor->data;
+
+        // Copy the weights
+        // Tensors are typically [n_expert, n_ff, n_embd] or similar
+        size_t gate_up_size = n_ff * n_embd;
+        size_t down_size = n_embd * n_ff;
+
+        std::vector<float> gate_w(gate_up_size);
+        std::vector<float> up_w(gate_up_size);
+        std::vector<float> down_w(down_size);
+
+        memcpy(gate_w.data(), gate_data, gate_up_size * sizeof(float));
+        memcpy(up_w.data(), up_data, gate_up_size * sizeof(float));
+        memcpy(down_w.data(), down_data, down_size * sizeof(float));
 
         // Step 1: gate_proj = gate_weight @ input
         // [n_ff, n_embd] @ [n_embd, n_tokens] = [n_ff, n_tokens]
@@ -463,33 +441,29 @@ int main(int argc, char * argv[]) {
     expert_weights_context * weights_ctx = load_expert_weights(params.model_path, expert_ids);
 
     if (!weights_ctx) {
-        fprintf(stderr, "Failed to load expert weights, will use synthetic weights\n");
+        fprintf(stderr, "ERROR: Failed to load expert weights from model\n");
+        fprintf(stderr, "       Make sure the model file contains MoE expert layers\n");
+        ggml_rpc_expert_shutdown();
+        return 1;
     }
 
     // Register evaluation callback with loaded weights
     ggml_rpc_expert_register_eval_callback(expert_eval_callback, weights_ctx);
-    fprintf(stderr, "Registered expert evaluation callback with actual FFN computation\n");
+    fprintf(stderr, "Registered expert evaluation callback\n");
 
     fprintf(stderr, "Expert worker initialized successfully\n");
     fprintf(stderr, "Listening on %s...\n", endpoint.c_str());
     fprintf(stderr, "Press Ctrl+C to stop\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "COMPUTATION MODE: Full FFN Pipeline ✅\n");
-    fprintf(stderr, "  - Matrix multiplication: gate_proj = gate_weight @ input\n");
-    fprintf(stderr, "  - Matrix multiplication: up_proj = up_weight @ input\n");
-    fprintf(stderr, "  - Activation: activated = silu(gate_proj) * up_proj (SwiGLU)\n");
-    fprintf(stderr, "  - Matrix multiplication: expert_out = down_weight @ activated\n");
-    fprintf(stderr, "  - Router weighting: output += router_weight * expert_out\n");
+    fprintf(stderr, "=== FFN Computation Pipeline ===\n");
+    fprintf(stderr, "  1. gate_proj = gate_weight @ input\n");
+    fprintf(stderr, "  2. up_proj = up_weight @ input\n");
+    fprintf(stderr, "  3. activated = silu(gate_proj) * up_proj (SwiGLU)\n");
+    fprintf(stderr, "  4. expert_out = down_weight @ activated\n");
+    fprintf(stderr, "  5. output += router_weight * expert_out\n");
+    fprintf(stderr, "================================\n");
     fprintf(stderr, "\n");
-    if (weights_ctx && weights_ctx->has_model_weights) {
-        fprintf(stderr, "WEIGHTS MODE: Actual model weights loaded from GGUF ✅\n");
-        fprintf(stderr, "              Gate weights: %zu entries\n", weights_ctx->gate_weights.size());
-        fprintf(stderr, "              Up weights:   %zu entries\n", weights_ctx->up_weights.size());
-        fprintf(stderr, "              Down weights: %zu entries\n", weights_ctx->down_weights.size());
-    } else {
-        fprintf(stderr, "WEIGHTS MODE: Synthetic weights (for testing)\n");
-        fprintf(stderr, "              Model weights not found - using deterministic patterns\n");
-    }
+    fprintf(stderr, "Ready to serve expert evaluations ✅\n");
     fprintf(stderr, "\n");
 
     // Server loop - worker thread handles requests
