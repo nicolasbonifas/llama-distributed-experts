@@ -11,8 +11,6 @@
 #include <stdio.h>
 #include <thread>
 #include <vector>
-#include <cmath>
-#include <cstring>
 #include <map>
 
 struct expert_server_params {
@@ -32,8 +30,6 @@ struct expert_weights_context {
     std::map<std::pair<int, int>, struct ggml_tensor *> gate_weights;
     std::map<std::pair<int, int>, struct ggml_tensor *> up_weights;
     std::map<std::pair<int, int>, struct ggml_tensor *> down_weights;
-
-    bool has_model_weights = false;
 };
 
 // Helper: Parse expert range "0-31" or "0,5,10" into a vector of expert IDs
@@ -122,32 +118,6 @@ static bool expert_server_params_parse(int argc, char ** argv, expert_server_par
         }
     }
     return true;
-}
-
-// Helper: Simple matrix multiplication for FFN computation
-// This performs C = A @ B where:
-//   A: [rows_a, cols_a]
-//   B: [cols_a, cols_b]
-//   C: [rows_a, cols_b]
-static void mat_mul_simple(
-    const float * A, int rows_a, int cols_a,
-    const float * B, int cols_b,
-    float * C
-) {
-    for (int i = 0; i < rows_a; i++) {
-        for (int j = 0; j < cols_b; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < cols_a; k++) {
-                sum += A[i * cols_a + k] * B[k * cols_b + j];
-            }
-            C[i * cols_b + j] = sum;
-        }
-    }
-}
-
-// Helper: SiLU activation function
-static inline float silu(float x) {
-    return x / (1.0f + expf(-x));
 }
 
 // Load expert weights from GGUF file
@@ -252,11 +222,16 @@ static expert_weights_context * load_expert_weights(
         return nullptr;
     }
 
-    ctx->has_model_weights = true;
     fprintf(stderr, "load_expert_weights: successfully loaded expert weights\n");
     fprintf(stderr, "  - Gate weights: %zu entries\n", ctx->gate_weights.size());
     fprintf(stderr, "  - Up weights:   %zu entries\n", ctx->up_weights.size());
     fprintf(stderr, "  - Down weights: %zu entries\n", ctx->down_weights.size());
+
+    // Close GGUF context - we only need ggml_ctx with tensor data from now on
+    if (ctx->gguf_ctx) {
+        gguf_free(ctx->gguf_ctx);
+        ctx->gguf_ctx = nullptr;
+    }
 
     return ctx;
 }
@@ -284,19 +259,34 @@ static bool expert_eval_callback(
     }
     fprintf(stderr, "\n");
 
-    // Tensor shapes for FFN computation:
-    //   input: [n_embd, n_tokens]
-    //   gate_weight: [n_ff, n_embd]
-    //   up_weight: [n_ff, n_embd]
-    //   down_weight: [n_embd, n_ff]
-    //   output: [n_embd, n_tokens]
-
     size_t output_size = n_embd * n_tokens;
 
     // Initialize output to zero
     for (size_t i = 0; i < output_size; i++) {
         output_data[i] = 0.0f;
     }
+
+    // Get weights context
+    auto * weights_ctx = (expert_weights_context *)user_data;
+    if (!weights_ctx) {
+        fprintf(stderr, "expert_eval_callback: ERROR - no model weights context\n");
+        return false;
+    }
+
+    // Create temporary GGML context for computation
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,  // We'll use existing buffers
+    };
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+    // Allocate computation buffers once, reuse for all experts
+    std::vector<float> gate_out_buf(n_ff * n_tokens);
+    std::vector<float> up_out_buf(n_ff * n_tokens);
+    std::vector<float> activated_buf(n_ff * n_tokens);
+    std::vector<float> expert_out_buf(n_embd * n_tokens);
 
     // For each expert, compute FFN and accumulate weighted result
     for (int e = 0; e < n_experts; e++) {
@@ -305,14 +295,6 @@ static bool expert_eval_callback(
 
         fprintf(stderr, "expert_eval_callback: computing FFN for expert %d (weight=%.6f)\n",
                 expert_id, router_weight);
-
-        // Get weights from loaded model
-        auto * weights_ctx = (expert_weights_context *)user_data;
-
-        if (!weights_ctx || !weights_ctx->has_model_weights) {
-            fprintf(stderr, "expert_eval_callback: ERROR - no model weights loaded\n");
-            return false;
-        }
 
         auto key = std::make_pair((int)layer_id, expert_id);
 
@@ -325,60 +307,69 @@ static bool expert_eval_callback(
             down_it == weights_ctx->down_weights.end()) {
             fprintf(stderr, "expert_eval_callback: ERROR - weights not found for layer %d, expert %d\n",
                     layer_id, expert_id);
+            ggml_free(ctx0);
             return false;
         }
 
-        // Extract expert weights from tensors
+        // Get expert weight tensors and calculate offsets
         struct ggml_tensor * gate_tensor = gate_it->second;
         struct ggml_tensor * up_tensor = up_it->second;
         struct ggml_tensor * down_tensor = down_it->second;
 
-        // Get tensor data pointers
-        float * gate_data = (float *)gate_tensor->data;
-        float * up_data = (float *)up_tensor->data;
-        float * down_data = (float *)down_tensor->data;
+        size_t gate_up_expert_size = n_ff * n_embd;
+        size_t down_expert_size = n_embd * n_ff;
 
-        // Copy the weights
-        // Tensors are typically [n_expert, n_ff, n_embd] or similar
-        size_t gate_up_size = n_ff * n_embd;
-        size_t down_size = n_embd * n_ff;
+        float * gate_w = ((float *)gate_tensor->data) + (expert_id * gate_up_expert_size);
+        float * up_w = ((float *)up_tensor->data) + (expert_id * gate_up_expert_size);
+        float * down_w = ((float *)down_tensor->data) + (expert_id * down_expert_size);
 
-        std::vector<float> gate_w(gate_up_size);
-        std::vector<float> up_w(gate_up_size);
-        std::vector<float> down_w(down_size);
+        // Create tensor views for GGML operations
+        struct ggml_tensor * input_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        struct ggml_tensor * gate_w_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_ff);
+        struct ggml_tensor * up_w_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_ff);
+        struct ggml_tensor * down_w_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_ff, n_embd);
 
-        memcpy(gate_w.data(), gate_data, gate_up_size * sizeof(float));
-        memcpy(up_w.data(), up_data, gate_up_size * sizeof(float));
-        memcpy(down_w.data(), down_data, down_size * sizeof(float));
+        // Assign data pointers
+        input_t->data = (void *)input_data;
+        gate_w_t->data = (void *)gate_w;
+        up_w_t->data = (void *)up_w;
+        down_w_t->data = (void *)down_w;
 
-        // Step 1: gate_proj = gate_weight @ input
-        // [n_ff, n_embd] @ [n_embd, n_tokens] = [n_ff, n_tokens]
-        std::vector<float> gate_out(n_ff * n_tokens);
-        mat_mul_simple(gate_w.data(), n_ff, n_embd, input_data, n_tokens, gate_out.data());
+        // Build computation graph: gate_proj = gate_weight @ input
+        struct ggml_tensor * gate_proj = ggml_mul_mat(ctx0, gate_w_t, input_t);
+        gate_proj->data = gate_out_buf.data();
 
-        // Step 2: up_proj = up_weight @ input
-        // [n_ff, n_embd] @ [n_embd, n_tokens] = [n_ff, n_tokens]
-        std::vector<float> up_out(n_ff * n_tokens);
-        mat_mul_simple(up_w.data(), n_ff, n_embd, input_data, n_tokens, up_out.data());
+        // up_proj = up_weight @ input
+        struct ggml_tensor * up_proj = ggml_mul_mat(ctx0, up_w_t, input_t);
+        up_proj->data = up_out_buf.data();
 
-        // Step 3: activated = silu(gate_proj) * up_proj (SwiGLU)
-        std::vector<float> activated(n_ff * n_tokens);
-        for (size_t i = 0; i < n_ff * n_tokens; i++) {
-            activated[i] = silu(gate_out[i]) * up_out[i];
-        }
+        // activated = silu(gate_proj) * up_proj
+        struct ggml_tensor * gate_silu = ggml_silu(ctx0, gate_proj);
+        gate_silu->data = gate_out_buf.data();  // Reuse buffer
 
-        // Step 4: expert_out = down_weight @ activated
-        // [n_embd, n_ff] @ [n_ff, n_tokens] = [n_embd, n_tokens]
-        std::vector<float> expert_out(n_embd * n_tokens);
-        mat_mul_simple(down_w.data(), n_embd, n_ff, activated.data(), n_tokens, expert_out.data());
+        struct ggml_tensor * activated = ggml_mul(ctx0, gate_silu, up_proj);
+        activated->data = activated_buf.data();
 
-        // Step 5: Add weighted expert output to final output
+        // expert_out = down_weight @ activated
+        struct ggml_tensor * expert_out = ggml_mul_mat(ctx0, down_w_t, activated);
+        expert_out->data = expert_out_buf.data();
+
+        // Build and compute graph
+        ggml_build_forward_expand(gf, expert_out);
+        ggml_graph_compute_with_ctx(ctx0, gf, 1);
+
+        // Accumulate weighted expert output
         for (size_t i = 0; i < output_size; i++) {
-            output_data[i] += router_weight * expert_out[i];
+            output_data[i] += router_weight * expert_out_buf[i];
         }
+
+        // Reset graph for next expert
+        ggml_graph_reset(gf);
 
         fprintf(stderr, "expert_eval_callback: expert %d FFN computation complete\n", expert_id);
     }
+
+    ggml_free(ctx0);
 
     fprintf(stderr, "expert_eval_callback: all experts evaluated\n");
     return true;
